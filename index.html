@@ -20,7 +20,7 @@ textarea{width:100%;min-height:65px}progress{width:100%;height:10px}
 </style>
 </head>
 <body>
-<header><h1>📅 PV Proof Reader — Telugu Calendar</h1><div>Compare the approved source against the designed sample, month by month and date by date.</div></header>
+<header><h1>📅 PV Proof Reader — Telugu Calendar</h1><div>Compare only matching date cells and the Pandagalu/festivals section.</div></header>
 <main>
 <section class="card">
 <h2>1. Upload both calendar pages</h2>
@@ -66,32 +66,52 @@ async function ocr(file,label){
  }
  const bitmap=await createImageBitmap(file);const c=document.createElement('canvas');const scale=Math.max(1,Math.min(2.5,3200/Math.max(bitmap.width,bitmap.height)));c.width=Math.round(bitmap.width*scale);c.height=Math.round(bitmap.height*scale);c.getContext('2d').drawImage(bitmap,0,0,c.width,c.height);bitmap.close?.();
  // OCR full image at enlarged native resolution; avoid destructive compression/downscaling.
- const r=await worker.recognize(c);c.width=1;c.height=1;return {text:r.data.text||'',confidence:Number.isFinite(r.data.confidence)?Math.round(r.data.confidence):null};
+ const r=await worker.recognize(c);c.width=1;c.height=1;return {text:r.data.text||'',words:(r.data.words||[]).map(w=>({text:w.text,x0:w.bbox?.x0||0,y0:w.bbox?.y0||0,x1:w.bbox?.x1||0,y1:w.bbox?.y1||0,confidence:w.confidence||0})),width:Math.round(c.width||0),confidence:Number.isFinite(r.data.confidence)?Math.round(r.data.confidence):null};
 }
-function dateBlocks(text){
- // Group OCR lines under visible day numbers when possible; retain all text and never silently discard unmatched lines.
- const lines=(text||'').split(/\r?\n/), blocks=[], pre=[];let cur=null;
- const re=/^\s*([0-3]?\d)\s*(?:[.)\-]|$)\s*(.*)$/;
- for(const raw of lines){const line=norm(raw);if(!line)continue;const m=line.match(re);const num=m?Number(m[1]):NaN;
-  // Only treat short leading numbers as date headers; avoid treating timings/long numeric strings as dates.
-  if(m&&num>=1&&num<=31&&m[1].length<=2&&(/^\s*\d{1,2}\s*$/.test(line)||line.length<45)){
-   if(cur)blocks.push(cur);cur={date:num,lines:[line]};
-  } else if(cur)cur.lines.push(line);else pre.push(line);
+function dateBlocks(result){
+ // Focus only on date-number anchors and the text following each anchor.
+ // This is OCR-based cell grouping, not a guarantee of exact visual cell boundaries.
+ const text=result.text||'', lines=text.split(/\r?\n/), blocks={}, before=[], dateRe=/^\s*([0-3]?\d)\s*(?:[.)\-]|$)\s*(.*)$/;
+ let current=null;
+ for(const raw of lines){
+  const line=norm(raw); if(!line) continue;
+  const m=line.match(dateRe), n=m?Number(m[1]):NaN;
+  if(m&&n>=1&&n<=31&&m[1].length<=2&&(/^\s*\d{1,2}\s*$/.test(line)||line.length<45)){
+   current={date:n,lines:[line]};(blocks[n]??=[]).push(current);
+  } else if(current) current.lines.push(line); else before.push(line);
  }
- if(cur)blocks.push(cur);
- const map={};for(const b of blocks){if(!map[b.date])map[b.date]=[];map[b.date].push(b.lines.join('\n'))}
- return {map,pre:pre.join('\n'),all:lines.map(norm).filter(Boolean).join('\n')};
+ return {blocks, all:text};
+}
+function festivalSection(text){
+ const lines=(text||'').split(/\r?\n/).map(norm).filter(Boolean);
+ const keys=['పండుగలు','పండుగ','పర్వదినాలు','వ్రతాలు','festivals','festival'];
+ let idx=lines.findIndex(l=>keys.some(k=>l.toLowerCase().includes(k.toLowerCase())));
+ if(idx<0)return {found:false,text:'Festival/Pandagalu heading was not confidently detected.'};
+ // Capture the festival list from its heading until a clear new section heading or the end.
+ const picked=[lines[idx]];
+ for(let i=idx+1;i<lines.length;i++){
+  const l=lines[i];
+  if(i>idx && /^(జనవరి|ఫిబ్రవరి|మార్చి|ఏప్రిల్|మే|జూన్|జూలై|ఆగస్టు|సెప్టెంబర్|అక్టోబర్|నవంబర్|డిసెంబర్|పండాంగం|పంచాంగం|సూర్యోదయం|సూర్యాస్తమయం)/.test(l)) break;
+  picked.push(l);
+ }
+ return {found:true,text:picked.join('\n')};
 }
 function compare(a,b){
- const A=dateBlocks(a.text),B=dateBlocks(b.text),out=[];
- const allDates=[...new Set([...Object.keys(A.map),...Object.keys(B.map)])].map(Number).sort((x,y)=>x-y);
- for(const d of allDates){const x=(A.map[d]||[]).join('\n--- repeated date ---\n'),y=(B.map[d]||[]).join('\n--- repeated date ---\n');
-  if(!x)out.push({where:'Date '+d,status:'Date detected only in sample',a:'[No matching date block confidently detected in source]',b:y,note:'Check date placement and OCR. This can be a layout/OCR error.'});
-  else if(!y)out.push({where:'Date '+d,status:'Date detected only in source',a:x,b:'[No matching date block confidently detected in sample]',note:'Check whether this date is missing or OCR failed to detect it.'});
-  else if(norm(x)!==norm(y))out.push({where:'Date '+d,status:'Text differs — manual proofreading required',a:x,b:y,note:'Compare every Telugu word, number, timing and punctuation in the cell. Text ordering can differ because of layout/OCR.'});
+ const A=dateBlocks(a),B=dateBlocks(b),out=[];
+ const allDates=[...new Set([...Object.keys(A.blocks),...Object.keys(B.blocks)])].map(Number).sort((x,y)=>x-y);
+ for(const d of allDates){
+  const x=(A.blocks[d]||[]).map(z=>z.lines.join('\n')).join('\n--- duplicate date anchor ---\n');
+  const y=(B.blocks[d]||[]).map(z=>z.lines.join('\n')).join('\n--- duplicate date anchor ---\n');
+  if(!x)out.push({where:'Date cell '+d,status:'Date cell not detected in source',a:'Not detected',b:y,note:'Check the source image and the date cell manually. OCR may have missed the date number.'});
+  else if(!y)out.push({where:'Date cell '+d,status:'Date cell not detected in sample',a:x,b:'Not detected',note:'Check whether the date is missing or OCR failed to detect it.'});
+  else if(norm(x)!==norm(y))out.push({where:'Date cell '+d,status:'Cell text differs — review required',a:x,b:y,note:'Compare only this date cell against its source cell. Confirm Telugu text, numbers, tithi/nakshatra and timings visually. OCR order may vary.'});
  }
- if(A.pre!==B.pre)out.push({where:'Month/year/headings and unassigned text',status:'Heading or unassigned text differs',a:A.pre,b:B.pre,note:'Verify month name, year name, weekday labels and all text not assigned to a date.'});
- if(!out.length)out.push({where:'Whole page',status:'No OCR text difference detected',a:A.all,b:B.all,note:'This is not proof of correctness. Verify calendar layout and all small text manually.'});
+ const fa=festivalSection(a.text),fb=festivalSection(b.text);
+ if(!fa.found||!fb.found||norm(fa.text)!==norm(fb.text)){
+  out.push({where:'Pandagalu / festivals section',status:(!fa.found||!fb.found)?'Festival section not confidently detected':'Festival section differs — review required',
+   a:fa.text,b:fb.text,note:'Compare only the Pandagalu/festivals list in the source and sample. If the heading was not detected, manually locate the section and verify it.'});
+ }
+ if(!out.length)out.push({where:'Date cells and Pandagalu section',status:'No differences detected by OCR — manual confirmation still required',a:'Date cells were compared by detected date number.',b:'Festival section was compared if detected.',note:'OCR is not proof of correctness. Check original images, especially small Telugu text.'});
  return out;
 }
 function render(){
@@ -109,7 +129,7 @@ $('compare').addEventListener('click',async()=>{
   worker=await Tesseract.createWorker($('lang').value,1,{logger:m=>{if(m.status)say('OCR engine: '+m.status+(m.progress!=null?' '+Math.round(m.progress*100)+'%':''));}});
   say('Reading source image/document…');const a=await ocr(f1,'Source');$('progress').value=45;
   say('Reading sample image/document…');const b=await ocr(f2,'Sample');$('progress').value=85;
-  say('Aligning date blocks and comparing extracted text…');const issues=compare(a,b);latest={a,b,issues,sourceName:f1.name,sampleName:f2.name};render();$('progress').value=100;say('Comparison complete. Review all flagged items; unclear OCR must be checked against the original image.');
+  say('Comparing detected date cells and the Pandagalu section…');const issues=compare(a,b);latest={a,b,issues,sourceName:f1.name,sampleName:f2.name};render();$('progress').value=100;say('Comparison complete. Review all flagged items; unclear OCR must be checked against the original image.');
  }catch(e){console.error(e);say('Comparison failed: '+(e?.message||e)+'\nCheck internet/file format and try again. If Telugu language data cannot load, try again on a stable connection.')}
  finally{busy(false)}
 });
